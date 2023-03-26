@@ -10,6 +10,8 @@
 #include <vector>
 #include <cmath>
 #include <queue>
+#include <sstream>
+#include <iomanip>
 
 Color dark = { 45, 45, 45, 255 };
 Color dark_gray = { 50, 51, 50, 255 };
@@ -21,6 +23,7 @@ int ScreenWidth = 1200;
 int ScreenHeight = 600;
 
 int scale_up = 0;
+bool drag_mode = false;
 bool update_texture = false;
 Color current_color = WHITE;
 bool erasing = false;
@@ -41,6 +44,249 @@ int selected_action = -1, action_index, cache_action = -1;
 bool update_cancel = false;
 std::string actions = "";
 std::vector<Image> image_cache;
+
+// dialog rectangles & vector saving for mouse drag
+Rectangle t_dialog_rec = { (float)(ScreenWidth - 250) / 2, (float)(ScreenHeight - 170) / 2,  250, 170 };
+Vector2 t_dialog_vec = { 0, 0 };
+Rectangle img_dialog_rec = { (float)(ScreenWidth - 350) / 2, (float)(ScreenHeight - 200) / 2, 350, 200 };
+Vector2 img_dialog_vec = { 0, 0 };
+Rectangle palette_dialog_rec = { (float)(ScreenWidth - 325) / 2, (float)(ScreenHeight - 195) / 2, 325, 195 };
+Vector2 palette_dialog_vec = { 0, 0 };
+//
+
+std::vector<Color> GenerateGradient(Color baseColor, int numColors, float step) {
+    std::vector<Color> colors;
+
+    if (numColors <= 1) {
+        colors.push_back(baseColor);
+        return colors;
+    }
+
+    float t = 0.0f;
+    float stepUp = step / (float)(numColors / 2 - 1);
+    for (int i = 0; i < numColors / 2; i++)
+    {
+        Color clr;
+
+        clr.r = (unsigned char)(baseColor.r + (255 - baseColor.r) * t);
+        clr.g = (unsigned char)(baseColor.g + (255 - baseColor.g) * t);
+        clr.b = (unsigned char)(baseColor.b + (255 - baseColor.b) * t);
+        clr.a = baseColor.a;
+        colors.push_back(clr);
+
+        t += stepUp;
+    }
+
+    // Calculate the gradient for decreasing values
+    t = 0.0f;
+    float stepDown = step / (float)(numColors / 2 - 1);
+    for (int i = 0; i < numColors / 2; i++)
+    {
+        Color clr;
+
+        clr.r = (unsigned char)(baseColor.r - baseColor.r * t);
+        clr.g = (unsigned char)(baseColor.g - baseColor.g * t);
+        clr.b = (unsigned char)(baseColor.b - baseColor.b * t);
+        clr.a = baseColor.a;
+        colors.push_back(clr);
+
+        t += stepDown;
+    }
+
+    // Sort the colors from darkest to brightest
+    std::sort(colors.begin(), colors.end(), [](const Color& c1, const Color& c2) {
+        return (c1.r + c1.g + c1.b) < (c2.r + c2.g + c2.b);
+        });
+
+    return colors;
+}
+
+void ResetDialogPositions() {
+    t_dialog_rec = { (float)(ScreenWidth - 250) / 2, (float)(ScreenHeight - 170) / 2,  250, 170 };
+    t_dialog_vec = { 0, 0 };
+    img_dialog_rec = { (float)(ScreenWidth - 350) / 2, (float)(ScreenHeight - 200) / 2, 350, 200 };
+    img_dialog_vec = { 0, 0 };
+    palette_dialog_rec = { (float)(ScreenWidth - 325) / 2, (float)(ScreenHeight - 195) / 2, 325, 195 };
+    palette_dialog_vec = { 0, 0 };
+}
+
+void UpdateDialogPosition(Rectangle& windowBounds, Vector2& panOffset) {
+    Vector2 mousePosition = GetMousePosition();
+
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+    {
+        // Window can be dragged from the top window bar
+        if (CheckCollisionPointRec(mousePosition, { windowBounds.x, windowBounds.y, (float)windowBounds.width, RAYGUI_WINDOWBOX_STATUSBAR_HEIGHT }))
+        {
+            drag_mode = true;
+            panOffset.x = mousePosition.x - windowBounds.x;
+            panOffset.y = mousePosition.y - windowBounds.y;
+        }
+    }
+
+    if (drag_mode)
+    {
+        windowBounds.x = (mousePosition.x - panOffset.x);
+        windowBounds.y = (mousePosition.y - panOffset.y);
+
+        // Check screen limits to avoid moving out of screen
+        if (windowBounds.x < 0) windowBounds.x = 0;
+        else if (windowBounds.x > (ScreenWidth - windowBounds.width)) windowBounds.x = ScreenWidth - windowBounds.width;
+
+        if (windowBounds.y < 0) windowBounds.y = 0;
+        else if (windowBounds.y > (ScreenHeight - windowBounds.height)) windowBounds.y = ScreenHeight - windowBounds.height;
+
+        if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) drag_mode = false;
+    }
+}
+
+Color GuiColorPalette(Rectangle bounds, const std::vector<Color> colors, int* scrollIndex, int active)
+{
+    int count = colors.size();
+    int* focus = NULL;
+    bool pressed = false;
+
+    GuiState state = guiState;
+    int itemFocused = (focus == NULL) ? -1 : *focus;
+    int itemSelected = active;
+
+    // Check if we need a scroll bar
+    bool useScrollBar = false;
+    if ((GuiGetStyle(LISTVIEW, LIST_ITEMS_HEIGHT) + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING)) * count > bounds.height) useScrollBar = true;
+
+    // Define base item rectangle [0]
+    Rectangle itemBounds = { 0 };
+    itemBounds.x = bounds.x + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING);
+    itemBounds.y = bounds.y + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING) + GuiGetStyle(DEFAULT, BORDER_WIDTH);
+    itemBounds.width = bounds.width - 2 * GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING) - GuiGetStyle(DEFAULT, BORDER_WIDTH);
+    itemBounds.height = (float)GuiGetStyle(LISTVIEW, LIST_ITEMS_HEIGHT);
+    if (useScrollBar) itemBounds.width -= GuiGetStyle(LISTVIEW, SCROLLBAR_WIDTH);
+
+    // Get items on the list
+    int visibleItems = (int)bounds.height / (GuiGetStyle(LISTVIEW, LIST_ITEMS_HEIGHT) + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING));
+    if (visibleItems > count) visibleItems = count;
+
+    int startIndex = (scrollIndex == NULL) ? 0 : *scrollIndex;
+    if ((startIndex < 0) || (startIndex > (count - visibleItems))) startIndex = 0;
+    int endIndex = startIndex + visibleItems;
+
+    // Update control
+    //--------------------------------------------------------------------
+    if ((state != STATE_DISABLED) && !guiLocked)
+    {
+        Vector2 mousePoint = GetMousePosition();
+
+        // Check mouse inside list view
+        if (CheckCollisionPointRec(mousePoint, bounds))
+        {
+            state = STATE_FOCUSED;
+
+            // Check focused and selected item
+            for (int i = 0; i < visibleItems; i++)
+            {
+                if (CheckCollisionPointRec(mousePoint, itemBounds))
+                {
+                    itemFocused = startIndex + i;
+                    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+                    {
+                        if (itemSelected == (startIndex + i)) itemSelected = -1;
+                        else itemSelected = startIndex + i;
+                    }
+                    break;
+                }
+
+                // Update item rectangle y position for next item
+                itemBounds.y += (GuiGetStyle(LISTVIEW, LIST_ITEMS_HEIGHT) + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING));
+            }
+
+            if (useScrollBar)
+            {
+                int wheelMove = (int)GetMouseWheelMove();
+                startIndex -= wheelMove;
+
+                if (startIndex < 0) startIndex = 0;
+                else if (startIndex > (count - visibleItems)) startIndex = count - visibleItems;
+
+                endIndex = startIndex + visibleItems;
+                if (endIndex > count) endIndex = count;
+            }
+        }
+        else itemFocused = -1;
+
+        // Reset item rectangle y to [0]
+        itemBounds.y = bounds.y + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING) + GuiGetStyle(DEFAULT, BORDER_WIDTH);
+    }
+    //--------------------------------------------------------------------
+
+    // Draw control
+    //--------------------------------------------------------------------
+    GuiDrawRectangle(bounds, GuiGetStyle(DEFAULT, BORDER_WIDTH), Fade(GetColor(GuiGetStyle(LISTVIEW, BORDER + state * 3)), guiAlpha), GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR)));     // Draw background
+
+    // Draw visible items
+    for (int i = 0; ((i < visibleItems) && !colors.empty()); i++)
+    {
+        if (state == STATE_DISABLED)
+        {
+            if ((startIndex + i) == itemSelected) GuiDrawRectangle(itemBounds, GuiGetStyle(LISTVIEW, BORDER_WIDTH), Fade(GetColor(GuiGetStyle(LISTVIEW, BORDER_COLOR_DISABLED)), guiAlpha), Fade(GetColor(GuiGetStyle(LISTVIEW, BASE_COLOR_DISABLED)), guiAlpha));
+
+            DrawRectangle(itemBounds.x, itemBounds.y, itemBounds.width, itemBounds.height, colors[startIndex + i]);
+        }
+        else
+        {
+            if ((startIndex + i) == itemSelected)
+            {
+                // Draw item selected
+                DrawRectangle(itemBounds.x, itemBounds.y, itemBounds.width, itemBounds.height, colors[startIndex + i]);
+                GuiDrawRectangle(itemBounds, GuiGetStyle(LISTVIEW, BORDER_WIDTH), Fade(GetColor(GuiGetStyle(LISTVIEW, BORDER_COLOR_PRESSED)), guiAlpha), Fade(GetColor(GuiGetStyle(LISTVIEW, BASE_COLOR_PRESSED)), guiAlpha));
+            }
+            else if ((startIndex + i) == itemFocused)
+            {
+                // Draw item focused
+                DrawRectangle(itemBounds.x, itemBounds.y, itemBounds.width, itemBounds.height, colors[startIndex + i]);
+                DrawRectangleLines(itemBounds.x, itemBounds.y, itemBounds.width, itemBounds.height, RAYWHITE);
+            }
+            else
+            {
+                // Draw item normal
+                DrawRectangle(itemBounds.x, itemBounds.y, itemBounds.width, itemBounds.height, colors[startIndex + i]);
+            }
+        }
+
+        // Update item rectangle y position for next item
+        itemBounds.y += (GuiGetStyle(LISTVIEW, LIST_ITEMS_HEIGHT) + GuiGetStyle(LISTVIEW, LIST_ITEMS_SPACING));
+    }
+
+    if (useScrollBar)
+    {
+        Rectangle scrollBarBounds = {
+            bounds.x + bounds.width - GuiGetStyle(LISTVIEW, BORDER_WIDTH) - GuiGetStyle(LISTVIEW, SCROLLBAR_WIDTH),
+            bounds.y + GuiGetStyle(LISTVIEW, BORDER_WIDTH), (float)GuiGetStyle(LISTVIEW, SCROLLBAR_WIDTH),
+            bounds.height - 2 * GuiGetStyle(DEFAULT, BORDER_WIDTH)
+        };
+
+        // Calculate percentage of visible items and apply same percentage to scrollbar
+        float percentVisible = (float)(endIndex - startIndex) / count;
+        float sliderSize = bounds.height * percentVisible;
+
+        int prevSliderSize = GuiGetStyle(SCROLLBAR, SCROLL_SLIDER_SIZE);   // Save default slider size
+        int prevScrollSpeed = GuiGetStyle(SCROLLBAR, SCROLL_SPEED); // Save default scroll speed
+        GuiSetStyle(SCROLLBAR, SCROLL_SLIDER_SIZE, (int)sliderSize);            // Change slider size
+        GuiSetStyle(SCROLLBAR, SCROLL_SPEED, count - visibleItems); // Change scroll speed
+
+        startIndex = GuiScrollBar(scrollBarBounds, startIndex, 0, count - visibleItems);
+
+        GuiSetStyle(SCROLLBAR, SCROLL_SPEED, prevScrollSpeed); // Reset scroll speed to default
+        GuiSetStyle(SCROLLBAR, SCROLL_SLIDER_SIZE, prevSliderSize); // Reset slider size to default
+    }
+    //--------------------------------------------------------------------
+
+    if (focus != NULL) *focus = itemFocused;
+    if (scrollIndex != NULL) *scrollIndex = startIndex;
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) pressed = true;
+
+    return (pressed && itemSelected > -1 && !colors.empty() ? colors[itemSelected] : BLANK);
+}
 
 bool PlayerButton(Rectangle bounds, const char* text, bool enabled)
 {
@@ -110,23 +356,27 @@ bool GuiButtonRound(Rectangle bounds, const char* text)
     return pressed;
 }
 
-bool GuiTextBoxFix(Rectangle bounds, char* text, int textSize, bool editMode)
+float GuiSliderModified(Rectangle bounds, const char* textLeft, const char* textRight, float value, float minValue, float maxValue)
 {
     GuiState state = guiState;
-    bool pressed = false;
-    int textWidth = GetTextWidth(text);
-    Rectangle textBounds = GetTextBounds(TEXTBOX, bounds);
-    int textAlignment = editMode && textWidth >= textBounds.width ? TEXT_ALIGN_RIGHT : GuiGetStyle(TEXTBOX, TEXT_ALIGNMENT);
 
-    Rectangle cursor = {
-        bounds.x + GuiGetStyle(TEXTBOX, TEXT_PADDING) + GetTextWidth(text) + 2,
-        bounds.y + bounds.height / 2 - GuiGetStyle(DEFAULT, TEXT_SIZE),
-        4,
-        (float)GuiGetStyle(DEFAULT, TEXT_SIZE) * 2
-    };
+    int sliderWidth = GuiGetStyle(SLIDER, SLIDER_WIDTH);
 
-    if (cursor.height >= bounds.height) cursor.height = bounds.height - GuiGetStyle(TEXTBOX, BORDER_WIDTH) * 2;
-    if (cursor.y < (bounds.y + GuiGetStyle(TEXTBOX, BORDER_WIDTH))) cursor.y = bounds.y + GuiGetStyle(TEXTBOX, BORDER_WIDTH);
+    int sliderValue = (int)(((value - minValue) / (maxValue - minValue)) * (bounds.width - 2 * GuiGetStyle(SLIDER, BORDER_WIDTH)));
+
+    Rectangle slider = { bounds.x, bounds.y + GuiGetStyle(SLIDER, BORDER_WIDTH) + GuiGetStyle(SLIDER, SLIDER_PADDING),
+                         0, bounds.height - 2 * GuiGetStyle(SLIDER, BORDER_WIDTH) - 2 * GuiGetStyle(SLIDER, SLIDER_PADDING) };
+
+    if (sliderWidth > 0)        // Slider
+    {
+        slider.x += (sliderValue - sliderWidth / 2);
+        slider.width = (float)sliderWidth;
+    }
+    else if (sliderWidth == 0)  // SliderBar
+    {
+        slider.x += GuiGetStyle(SLIDER, BORDER_WIDTH);
+        slider.width = (float)sliderValue;
+    }
 
     // Update control
     //--------------------------------------------------------------------
@@ -134,87 +384,128 @@ bool GuiTextBoxFix(Rectangle bounds, char* text, int textSize, bool editMode)
     {
         Vector2 mousePoint = GetMousePosition();
 
-        if (editMode)
+        if (CheckCollisionPointRec(mousePoint, bounds))
         {
-            state = STATE_PRESSED;
-
-            int key = GetCharPressed();      // Returns codepoint as Unicode
-            int keyCount = (int)strlen(text);
-            int byteSize = 0;
-            const char* textUTF8 = CodepointToUTF8(key, &byteSize);
-
-            // Only allow keys in range [32..125]
-            if ((keyCount + byteSize) < textSize)
+            if (IsMouseButtonDown(MOUSE_LEFT_BUTTON))
             {
-                float maxWidth = (bounds.width - (GuiGetStyle(TEXTBOX, TEXT_INNER_PADDING) * 2));
+                state = STATE_PRESSED;
 
-                if (key >= 32)
-                {
-                    for (int i = 0; i < byteSize; i++)
-                    {
-                        text[keyCount] = textUTF8[i];
-                        keyCount++;
-                    }
+                // Get equivalent value and slider position from mousePoint.x
+                value = ((maxValue - minValue) * (mousePoint.x - (float)(bounds.x + sliderWidth / 2))) / (float)(bounds.width - sliderWidth) + minValue;
 
-                    text[keyCount] = '\0';
-                }
+                if (sliderWidth > 0) slider.x = mousePoint.x - slider.width / 2;  // Slider
+                else if (sliderWidth == 0) slider.width = (float)sliderValue;          // SliderBar
             }
-
-            // Delete text
-            if (keyCount > 0)
-            {
-                if (IsKeyPressed(KEY_BACKSPACE))
-                {
-                    while ((keyCount > 0) && ((text[--keyCount] & 0xc0) == 0x80));
-                    text[keyCount] = '\0';
-                }
-            }
-
-            if (IsKeyPressed(KEY_ENTER) || (!CheckCollisionPointRec(mousePoint, bounds) && IsMouseButtonPressed(MOUSE_LEFT_BUTTON))) pressed = true;
-
-            // Check text alignment to position cursor properly
-            if (textAlignment == TEXT_ALIGN_CENTER) cursor.x = bounds.x + GetTextWidth(text) / 2 + bounds.width / 2 + 1;
-            else if (textAlignment == TEXT_ALIGN_RIGHT) cursor.x = bounds.x + bounds.width - GuiGetStyle(TEXTBOX, TEXT_INNER_PADDING) - GuiGetStyle(TEXTBOX, BORDER_WIDTH);
+            else state = STATE_FOCUSED;
         }
-        else
-        {
-            if (CheckCollisionPointRec(mousePoint, bounds))
-            {
-                state = STATE_FOCUSED;
-                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) pressed = true;
-            }
-        }
+
+        if (value > maxValue) value = maxValue;
+        else if (value < minValue) value = minValue;
+    }
+
+    // Bar limits check
+    if (sliderWidth > 0)        // Slider
+    {
+        if (slider.x <= (bounds.x + GuiGetStyle(SLIDER, BORDER_WIDTH))) slider.x = bounds.x + GuiGetStyle(SLIDER, BORDER_WIDTH);
+        else if ((slider.x + slider.width) >= (bounds.x + bounds.width)) slider.x = bounds.x + bounds.width - slider.width - GuiGetStyle(SLIDER, BORDER_WIDTH);
+    }
+    else if (sliderWidth == 0)  // SliderBar
+    {
+        if (slider.width > bounds.width) slider.width = bounds.width - 2 * GuiGetStyle(SLIDER, BORDER_WIDTH);
     }
     //--------------------------------------------------------------------
+
     // Draw control
     //--------------------------------------------------------------------
-    if (state == STATE_PRESSED)
+    GuiDrawRectangle(bounds, GuiGetStyle(SLIDER, BORDER_WIDTH), Fade(GetColor(GuiGetStyle(SLIDER, BORDER + (state * 3))), guiAlpha), Fade(GetColor(GuiGetStyle(SLIDER, (state != STATE_DISABLED) ? BASE_COLOR_NORMAL : BASE_COLOR_DISABLED)), guiAlpha));
+
+    // Draw slider internal bar (depends on state)
+    if ((state == STATE_NORMAL) || (state == STATE_PRESSED)) GuiDrawRectangle(slider, 0, BLANK, Fade(GetColor(GuiGetStyle(SLIDER, BASE_COLOR_PRESSED)), guiAlpha));
+    else if (state == STATE_FOCUSED) GuiDrawRectangle(slider, 0, BLANK, Fade(GetColor(GuiGetStyle(SLIDER, TEXT_COLOR_FOCUSED)), guiAlpha));
+
+    // Draw left/right text if provided
+    if (textLeft != NULL)
     {
-        DrawRectangleRounded(bounds, 0.2, 64, Fade(GetColor(GuiGetStyle(TEXTBOX, BASE_COLOR_PRESSED)), guiAlpha));
-    }
-    else if (state == STATE_DISABLED)
-    {
-        DrawRectangleRounded(bounds, 0.2, 64, Fade(GetColor(GuiGetStyle(TEXTBOX, BASE_COLOR_DISABLED)), guiAlpha));
-    }
-    else {
-        DrawRectangleRounded(bounds, 0.2, 64, Fade(GetColor(GuiGetStyle(TEXTBOX, BORDER + (state * 3))), guiAlpha));
+        Rectangle textBounds = { 0 };
+        textBounds.width = (float)GetTextWidth(textLeft);
+        textBounds.height = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+        textBounds.x = bounds.x - textBounds.width - GuiGetStyle(SLIDER, TEXT_PADDING);
+        textBounds.y = bounds.y + bounds.height / 2 - GuiGetStyle(DEFAULT, TEXT_SIZE) / 2;
+
+        GuiDrawText(textLeft, textBounds, TEXT_ALIGN_RIGHT, { 179, 179, 179, 255 });
     }
 
-    // in case we edit and text does not fit in the textbox show right aligned and character clipped, slower but working
-    while (textWidth >= textBounds.width && *text)
+    if (textRight != NULL)
     {
-        int bytes = 0;
-        GetCodepoint(text, &bytes);
-        text += bytes;
-        textWidth = GetTextWidth(text);
-    }
-    GuiDrawText(text, textBounds, textAlignment, Fade(GetColor(GuiGetStyle(TEXTBOX, TEXT + (state * 3))), guiAlpha));
+        Rectangle textBounds = { 0 };
+        textBounds.width = (float)GetTextWidth(textRight);
+        textBounds.height = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+        textBounds.x = bounds.x + bounds.width + GuiGetStyle(SLIDER, TEXT_PADDING);
+        textBounds.y = bounds.y + bounds.height / 2 - GuiGetStyle(DEFAULT, TEXT_SIZE) / 2;
 
-    // Draw cursor
-    if (editMode) GuiDrawRectangle(cursor, 0, BLANK, Fade(GetColor(GuiGetStyle(TEXTBOX, BORDER_COLOR_PRESSED)), guiAlpha));
+        GuiDrawText(textRight, textBounds, TEXT_ALIGN_LEFT, { 179, 179, 179, 255 });
+    }
     //--------------------------------------------------------------------
 
-    return pressed;
+    return value;
+}
+
+bool GuiCheckBoxRound(Rectangle bounds, const char* text, bool checked)
+{
+    GuiState state = guiState;
+
+    Rectangle textBounds = { 0 };
+
+    if (text != NULL)
+    {
+        textBounds.width = (float)GetTextWidth(text);
+        textBounds.height = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+        textBounds.x = bounds.x + bounds.width + GuiGetStyle(CHECKBOX, TEXT_PADDING);
+        textBounds.y = bounds.y + bounds.height / 2 - GuiGetStyle(DEFAULT, TEXT_SIZE) / 2;
+        if (GuiGetStyle(CHECKBOX, TEXT_ALIGNMENT) == TEXT_ALIGN_LEFT) textBounds.x = bounds.x - textBounds.width - GuiGetStyle(CHECKBOX, TEXT_PADDING);
+    }
+
+    // Update control
+    //--------------------------------------------------------------------
+    if ((state != STATE_DISABLED) && !guiLocked)
+    {
+        Vector2 mousePoint = GetMousePosition();
+
+        Rectangle totalBounds = {
+            (GuiGetStyle(CHECKBOX, TEXT_ALIGNMENT) == TEXT_ALIGN_LEFT) ? textBounds.x : bounds.x,
+            bounds.y,
+            bounds.width + textBounds.width + GuiGetStyle(CHECKBOX, TEXT_PADDING),
+            bounds.height,
+        };
+
+        // Check checkbox state
+        if (CheckCollisionPointRec(mousePoint, totalBounds))
+        {
+            if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) state = STATE_PRESSED;
+            else state = STATE_FOCUSED;
+
+            if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) checked = !checked;
+        }
+    }
+    //--------------------------------------------------------------------
+
+    // Draw control
+    //--------------------------------------------------------------------
+    GuiDrawRectangle(bounds, GuiGetStyle(CHECKBOX, BORDER_WIDTH), Fade(GetColor(GuiGetStyle(CHECKBOX, BORDER + (state * 3))), guiAlpha), BLANK);
+
+    if (checked)
+    {
+        Rectangle check = { bounds.x + GuiGetStyle(CHECKBOX, BORDER_WIDTH) + GuiGetStyle(CHECKBOX, CHECK_PADDING),
+                            bounds.y + GuiGetStyle(CHECKBOX, BORDER_WIDTH) + GuiGetStyle(CHECKBOX, CHECK_PADDING),
+                            bounds.width - 2 * (GuiGetStyle(CHECKBOX, BORDER_WIDTH) + GuiGetStyle(CHECKBOX, CHECK_PADDING)),
+                            bounds.height - 2 * (GuiGetStyle(CHECKBOX, BORDER_WIDTH) + GuiGetStyle(CHECKBOX, CHECK_PADDING)) };
+        GuiDrawIcon(ICON_OK_TICK, check.x, check.y, 2, Fade(GetColor(GuiGetStyle(CHECKBOX, TEXT + state * 3)), guiAlpha));
+    }
+
+    GuiDrawText(text, textBounds, (GuiGetStyle(CHECKBOX, TEXT_ALIGNMENT) == TEXT_ALIGN_RIGHT) ? TEXT_ALIGN_LEFT : TEXT_ALIGN_RIGHT, state != STATE_FOCUSED ? Fade(GetColor(GuiGetStyle(LABEL, TEXT + (state * 3))), guiAlpha) : RAYWHITE);
+    //--------------------------------------------------------------------
+
+    return checked;
 }
 
 void GuiPanelModified(Rectangle bounds, const char* text)
@@ -347,8 +638,62 @@ void DrawRectangleFloat(float x, float y, float width, float height, Color color
     DrawRectangleLinesEx({ x, y, width, height }, 1, color);
 }
 
-void DrawRectangleLinesExNeg(Vector2 position, Vector2 size, float lineThick, Color color)
-{
+void DrawDashedLineEx(Vector2 startPos, Vector2 endPos, float lineThick, Color color, float dashLength, float gapLength) {
+    float dx = endPos.x - startPos.x;
+    float dy = endPos.y - startPos.y;
+    float lineLength = sqrtf(dx * dx + dy * dy);
+    float normX = dx / lineLength;
+    float normY = dy / lineLength;
+
+    Vector2 currentPos = startPos;
+    float currentLength = 0.0f;
+    bool drawingDash = true;
+
+    while (currentLength < lineLength)
+    {
+        float remainingLength = lineLength - currentLength;
+        float segmentLength = drawingDash ? fminf(remainingLength, dashLength) : fminf(remainingLength, gapLength);
+
+        Vector2 segmentEndPos = { currentPos.x + normX * segmentLength, currentPos.y + normY * segmentLength };
+
+        if (drawingDash)
+        {
+            DrawLineEx(currentPos, segmentEndPos, lineThick, color);
+        }
+
+        currentPos = segmentEndPos;
+        currentLength += segmentLength;
+        drawingDash = !drawingDash;
+
+        // Adjust segment length to account for accumulated rounding error.
+        if (currentLength + gapLength >= lineLength && !drawingDash)
+        {
+            segmentLength -= (currentLength + gapLength - lineLength);
+        }
+    }
+}
+
+void DrawRectangleLinesDashed(Vector2 position, Vector2 size, float lineThick, Color color) {
+    float x1 = position.x;
+    float y1 = position.y;
+    float x2 = position.x + size.x;
+    float y2 = position.y;
+    float x3 = position.x + size.x;
+    float y3 = position.y + size.y;
+    float x4 = position.x;
+    float y4 = position.y + size.y;
+
+    float dashLength = 7;
+    float gapLength = 7;
+
+    // Ensure that the lines do not intersect in the center.
+    DrawDashedLineEx({ x1, y1 }, { x2, y2 }, lineThick, color, dashLength, gapLength);
+    DrawDashedLineEx({ x2, y2 }, { x3, y3 }, lineThick, color, dashLength, gapLength);
+    DrawDashedLineEx({ x3, y3 }, { x4, y3 }, lineThick, color, dashLength, gapLength);
+    DrawDashedLineEx({ x4, y3 }, { x1, y1 }, lineThick, color, dashLength, gapLength);
+}
+
+void DrawRectangleLinesExNeg(Vector2 position, Vector2 size, float lineThick, Color color) {
     float x1 = position.x;
     float y1 = position.y;
     float x2 = position.x + size.x;
@@ -494,7 +839,7 @@ void fill_area(Image& image, Color color, Vector2 pos, float tolerance) {
 void draw_pixel_grid(Image image, std::vector<Image>& images, int index, float dimensions, Vector2 pos) {
     float pixelSize = dimensions / image.width;
     if (selected_area) //draw selected area
-        DrawRectangleLinesExNeg({ originX, originY },{ recX, recY }, 1, RAYWHITE);
+        DrawRectangleLinesDashed({ originX, originY },{ recX, recY }, 1, RAYWHITE);
     for (int i = 0; i < image.width; i++) {
         for (int j = 0; j < image.width; j++) {
             float posX = pos.x + (i * pixelSize);
@@ -601,6 +946,7 @@ void draw_pixel_grid(Image image, std::vector<Image>& images, int index, float d
                         update_cancel = true;
                     }
                 }
+                break;
             }
         }
     }
@@ -635,6 +981,12 @@ void export_animation(std::vector<Image> images, const char* path) {
     UnloadImage(animation);
 }
 
+std::string SetDecimalPrecision(double value, int precision) {
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(precision) << value;
+    return ss.str();
+}
+
 int main()
 {
     Image icon = LoadImage("ico_umbr.png");
@@ -665,6 +1017,13 @@ int main()
     std::string frames_a = "";
     int index_a, selected_a = -1, preview_cache_a = -1;
 
+    int color_index;
+    std::vector<Color> colors;
+    bool generating_palette = false;
+    float color_count_f = 0;
+    bool replace_palette = false;
+    float color_step = 0;
+
     //generate the alpha texture backround
     Image img_temp_ = GenImageGradientH(400, 400, BLANK, BLANK);
     for (int y = 0; y < 400; y += 8)
@@ -680,21 +1039,19 @@ int main()
 
     while (!WindowShouldClose()) {
 
-        if (IsWindowResized()) {
-            if (!IsWindowFullscreen()) {
-                ScreenWidth = GetScreenWidth();
-                ScreenHeight = GetScreenHeight();
-            }
-            else {
-                ScreenWidth = GetMonitorWidth(GetCurrentMonitor());
-                ScreenHeight = GetMonitorHeight(GetCurrentMonitor());
-            }
-            if ((GetScreenHeight() - 600) < GetScreenWidth() - 1200) {
-                scale_up = (GetScreenHeight() - 600);
-            }
-            else
-                scale_up = 0;
+        if (!IsWindowFullscreen()) {
+            ScreenWidth = GetScreenWidth();
+            ScreenHeight = GetScreenHeight();
         }
+        else {
+            ScreenWidth = GetMonitorWidth(GetCurrentMonitor());
+            ScreenHeight = GetMonitorHeight(GetCurrentMonitor());
+        }
+        if ((GetScreenHeight() - 600) < GetScreenWidth() - 1200) {
+            scale_up = (GetScreenHeight() - 600);
+        }
+        else
+            scale_up = 0;
 
         if (animating && !animationFrames.empty()) {
             if (selected_a != -1 && selected_a != animationFrames.size())
@@ -886,9 +1243,12 @@ int main()
         }
         else if (!history) {
             DrawRectangleRounded({ (float)ScreenWidth - 140, 398, 120, 55 }, 0.5, 12, right_dark);
+            Color palette_color = GuiColorPalette({ (float)ScreenWidth - 315, 435, 310, (float)ScreenHeight - 480 }, colors, &color_index, -1);
+            if (!ColorEquals(palette_color, BLANK)) current_color = palette_color;
+            if (GuiButtonRound({ (float)ScreenWidth - 315, (float)ScreenHeight - 40, 310, 35 }, "Generate Palette") && !in_dialog) generating_palette = true;
         }
 
-        GuiLabel({ (float)ScreenWidth - 115, 388, 120, 50 }, "Color Pallete");
+        GuiLabel({ (float)ScreenWidth - 115, 388, 120, 50 }, "Color Palette");
         GuiLabel({ (float)ScreenWidth - 280, 388, 120, 50 }, "Action History");
 
         //------------------------------------------------//
@@ -927,19 +1287,40 @@ int main()
         //-----//
 
         //------------------------------------------------//
+        //------------Generate Palette Dialog-------------//
+        //------------------------------------------------//
+
+        if (generating_palette) {
+            in_dialog = true;
+            UpdateDialogPosition(palette_dialog_rec, palette_dialog_vec);
+            if (GuiWindowBoxModified(palette_dialog_rec, "Palette Editor")) generating_palette = false;
+            color_count_f = GuiSliderModified({ palette_dialog_rec.x + 50, palette_dialog_rec.y + 40, 250, 25 }, "Colors:", std::to_string((int)color_count_f).c_str(), color_count_f, 1, 100);
+            color_step = GuiSliderModified({ palette_dialog_rec.x + 70, palette_dialog_rec.y + 75, 225, 25 }, "Color step:", SetDecimalPrecision(color_step, 2).c_str(), color_step, 1, 5);
+            replace_palette = GuiCheckBoxRound({ palette_dialog_rec.x + 8, palette_dialog_rec.y + 105, 35, 35 }, "Replace current palette", replace_palette);
+            if (GuiButtonRound({ (float)(palette_dialog_rec.x + 45.5), (float)(palette_dialog_rec.y + 155), 100, 30 }, "generate")) {
+                std::vector<Color> temp_colors = GenerateGradient(current_color, (int)color_count_f, color_step);
+                if (replace_palette) colors.clear();
+                for (const Color& color : temp_colors)
+                    colors.push_back(color);
+            }
+            if (GuiButtonRound({ (float)(palette_dialog_rec.x + 175.5), (float)(palette_dialog_rec.y + 155), 100, 30 }, "cancel")) generating_palette = false;
+        }
+
+        //------------------------------------------------//
         //------------Bucket Tolerance Dialog-------------//
         //------------------------------------------------//
 
         if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && CheckCollisionPointRec(GetMousePosition(), { (float)ScreenWidth - 146, 344, 35, 35 }) && !in_dialog)
-                tolerance_dialog = true;
+            tolerance_dialog = true;
+        UpdateDialogPosition(t_dialog_rec, t_dialog_vec);
         if (tolerance_dialog) {
-            if (GuiWindowBoxModified({ (float)(ScreenWidth - 250) / 2, (float)(ScreenHeight - 170) / 2,  250, 170 }, "Bucket fill tolerance")) {
+            if (GuiWindowBoxModified(t_dialog_rec, "Bucket fill tolerance")) {
                 tolerance_dialog = false;
             }
-            float tolerance_ = GuiSlider({ (float)(ScreenWidth - 200) / 2, (float)(ScreenHeight - 35) / 2, 200, 35 }, "", "", _tolerance, 0, 50);
+            float tolerance_ = GuiSlider({ (float)t_dialog_rec.x + 25, (float)t_dialog_rec.y + 50, 200, 35 }, "", "", _tolerance, 0, 50);
             _tolerance = tolerance_;
             tolerance = (int)tolerance_;
-            GuiDrawText(std::to_string(tolerance).c_str(),{ (float)(((ScreenWidth - 52.5 + (tolerance != 100 ? tolerance >= 10 ? 47.5 : 50 : 45))) / 2), (float)(ScreenHeight + 45) / 2, 200, 55 }, 0, RAYWHITE);
+            GuiDrawText(std::to_string(tolerance).c_str(),{ (float)(((t_dialog_rec.x + 72.5 + (tolerance != 100 ? tolerance >= 10 ? 47.5 : 50 : 45)))), (float)(t_dialog_rec.y + 95), 200, 55 }, 0, RAYWHITE);
             in_dialog = true;
         }
 
@@ -964,14 +1345,15 @@ int main()
 
         if (empty_image_dialog) {
             in_dialog = true;
-            if (GuiWindowBoxModified({ (float)(ScreenWidth - 350) / 2, (float)(ScreenHeight - 200) / 2, 350, 200 }, "#176# Blank Image")) {
+            UpdateDialogPosition(img_dialog_rec, img_dialog_vec);
+            if (GuiWindowBoxModified(img_dialog_rec, "#176# Blank Image")) {
                 empty_image_dialog = false;
             }
-            float pixels = GuiSlider({ (float)(ScreenWidth - 200) / 2, (float)(ScreenHeight - 100) / 2, 200, 30 }, "", "", pixels_int, 1, 64);
+            float pixels = GuiSlider({ (float)img_dialog_rec.x + 75, (float)img_dialog_rec.y + 50, 200, 30 }, "", "", pixels_int, 1, 64);
             pixels_int = (int)pixels;
             std::string tempS = std::to_string(pixels_int) + " X " + std::to_string(pixels_int);
-            GuiDrawText(tempS.c_str(), { (float)(ScreenWidth - (pixels >= 10 ? 45 : 30)) / 2, (float)(ScreenHeight - 25) / 2 }, 3, RAYWHITE);
-            if (GuiButtonRound({ (float)(ScreenWidth - 240) / 2, (float)(ScreenHeight + 100) / 2, 100, 35 }, "add")) {
+            GuiDrawText(tempS.c_str(), { (float)(img_dialog_rec.x + (pixels >= 10 ? 155 : 160)), (float)(img_dialog_rec.y + 100) }, 3, RAYWHITE);
+            if (GuiButtonRound({ (float)(img_dialog_rec.x + 59.5), (float)(img_dialog_rec.y + 150), 100, 30 }, "add")) {
                 empty_image_dialog = false;
                 Image img_blank = GenImageGradientH(pixels_int, pixels_int, BLANK, BLANK);
                 animating = false;
@@ -985,9 +1367,7 @@ int main()
                 }
                 selected = imageFrames.size() - 1;
             }
-            if (GuiButtonRound({ (float)(ScreenWidth + 30) / 2, (float)(ScreenHeight + 100) / 2, 100, 35 }, "cancel")) {
-                empty_image_dialog = false;
-            }
+            if (GuiButtonRound({ (float)(img_dialog_rec.x + 189.5), (float)(img_dialog_rec.y + 150), 100, 30 }, "cancel")) empty_image_dialog = false;
         }
 
         //------------------------------------------------//
@@ -1049,14 +1429,14 @@ int main()
             }
             else {
                 char file_location[1024] = { 0 };
-                int result = GuiFileDialog(DIALOG_SAVE_FILE, "Save animation strip image...", file_location, "*.png", "Animation strip (*.png)");
+                int result = GuiFileDialog(DIALOG_SAVE_FILE, "Save animation strip image...", file_location, "*.png", "Animation Strip (*.png)");
                 if (result == 1) {
                     export_animation(animationFrames, file_location);
                 }
             }
         }
 
-        if (!file_dialog && !unsupported_file_dialog && !empty_image_dialog && !tolerance_dialog && in_dialog) in_dialog = false;
+        if (!file_dialog && !unsupported_file_dialog && !empty_image_dialog && !tolerance_dialog && !generating_palette && in_dialog) { in_dialog = false; drag_mode = false; ResetDialogPositions(); }
 
         BeginDrawing();
         EndDrawing();
